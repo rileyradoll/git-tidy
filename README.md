@@ -6,10 +6,26 @@ Interactive tool to clean up stale local git branches.
 
 ## Installation
 
-### Quick install (curl)
+### Quick install (from release)
 
 ```bash
-curl -sL https://raw.githubusercontent.com/rileyradoll/git-tidy/main/git-tidy -o /usr/local/bin/git-tidy && chmod +x /usr/local/bin/git-tidy
+curl -sL https://github.com/rileyradoll/git-tidy/releases/latest/download/git-tidy -o /usr/local/bin/git-tidy && chmod +x /usr/local/bin/git-tidy
+```
+
+### Install with verification (recommended)
+
+```bash
+# Download script and checksum
+curl -sL https://github.com/rileyradoll/git-tidy/releases/latest/download/git-tidy -o git-tidy
+curl -sL https://github.com/rileyradoll/git-tidy/releases/latest/download/checksums.txt -o checksums.txt
+
+# Verify checksum
+shasum -a 256 -c checksums.txt
+
+# Install if verification passes
+sudo mv git-tidy /usr/local/bin/git-tidy
+sudo chmod +x /usr/local/bin/git-tidy
+rm checksums.txt
 ```
 
 ### Using make
@@ -17,14 +33,15 @@ curl -sL https://raw.githubusercontent.com/rileyradoll/git-tidy/main/git-tidy -o
 ```bash
 git clone https://github.com/rileyradoll/git-tidy.git
 cd git-tidy
-make install
+sudo make install
 ```
 
 ### Manual
 
-1. Download the `git-tidy` script
-2. Place it somewhere in your `$PATH` (e.g., `/usr/local/bin/`)
-3. Make it executable: `chmod +x /usr/local/bin/git-tidy`
+1. Download the `git-tidy` script from [releases](https://github.com/rileyradoll/git-tidy/releases)
+2. Verify the checksum matches `checksums.txt`
+3. Place it somewhere in your `$PATH` (e.g., `/usr/local/bin/`)
+4. Make it executable: `chmod +x /usr/local/bin/git-tidy`
 
 ## Usage
 
