@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# git-tidy: Interactive tool to prune stale local git branches
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+show_help() {
+  cat <<EOF
+Usage: git tidy [OPTIONS]
+
+Interactive tool to clean up stale local git branches.
+
+Options:
+  --help          Show this help message
+  --dry-run       Preview branches without deleting
+  --merged        Only show branches merged to default branch
+  --stale=DAYS    Only show branches with no commits in DAYS days (default: show all)
+  --fetch         Run 'git fetch --prune' before starting
+
+Environment:
+  TIDY_GIT_PROTECTED   Space-separated list of additional protected branch patterns
+                       Example: export TIDY_GIT_PROTECTED="release hotfix"
+
+Protected branches (never offered for deletion):
+  main, master, develop, development, staging, production
+  Plus any branches in TIDY_GIT_PROTECTED
+
+Examples:
+  git tidy                    # Interactive cleanup of all branches
+  git tidy --dry-run          # Preview what would be shown
+  git tidy --merged           # Only show merged branches
+  git tidy --stale=30         # Only show branches older than 30 days
+  git tidy --fetch --merged   # Fetch first, then show merged branches
+EOF
+}
+
+# Parse arguments
+dry_run=false
+merged_only=false
+stale_days=0
+do_fetch=false
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --help|-h)
+      show_help
+      exit 0
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    --merged)
+      merged_only=true
+      shift
+      ;;
+    --stale=*)
+      stale_days="${1#*=}"
+      if ! [[ "$stale_days" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Error: --stale requires a number (e.g., --stale=30)${NC}"
+        exit 1
+      fi
+      shift
+      ;;
+    --fetch)
+      do_fetch=true
+      shift
+      ;;
+    *)
+      echo -e "${RED}Unknown option: $1${NC}"
+      echo "Use --help for usage information"
+      exit 1
+      ;;
+  esac
+done
+
+# Ensure we're in a git repository
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo -e "${RED}Error: Not in a git repository${NC}"
+  exit 1
+fi
+
+# Run fetch if requested
+if $do_fetch; then
+  echo -e "${BLUE}Fetching and pruning remote tracking branches...${NC}"
+  git fetch --prune
+  echo ""
+fi
+
+# Get current branch to protect it
+current_branch=$(git branch --show-current)
+
+# Protected branches (never offer to delete these)
+protected_patterns=("main" "master" "develop" "development" "staging" "production")
+
+# Add custom protected branches from environment variable
+if [[ -n "${TIDY_GIT_PROTECTED:-}" ]]; then
+  read -ra custom_protected <<< "$TIDY_GIT_PROTECTED"
+  protected_patterns+=("${custom_protected[@]}")
+fi
+
+# Get default branch (usually main or master)
+default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@') || true
+if [[ -z "$default_branch" ]]; then
+  # Fallback: try to detect main or master
+  if git rev-parse --verify origin/main >/dev/null 2>&1; then
+    default_branch="main"
+  elif git rev-parse --verify origin/master >/dev/null 2>&1; then
+    default_branch="master"
+  fi
+fi
+
+# Arrays to track results
+deleted_branches=()
+protected_branches=()
+skipped_branches=()
+
+# Get all local branches except the current one, sorted by commit date (oldest first)
+branches=$(git for-each-ref --sort=committerdate --format='%(refname:short)' refs/heads/ | grep -v "^${current_branch}$") || true
+
+if [[ -z "$branches" ]]; then
+  echo -e "${YELLOW}No other local branches to review.${NC}"
+  exit 0
+fi
+
+# Header
+echo -e "${BLUE}=== git-tidy: Interactive Branch Cleanup ===${NC}"
+echo -e "Current branch: ${GREEN}$current_branch${NC} (protected)"
+if $dry_run; then
+  echo -e "${YELLOW}DRY RUN MODE - No branches will be deleted${NC}"
+fi
+if $merged_only; then
+  echo -e "Filter: ${BLUE}merged branches only${NC}"
+fi
+if [[ $stale_days -gt 0 ]]; then
+  echo -e "Filter: ${BLUE}branches older than $stale_days days${NC}"
+fi
+echo ""
+
+# Process each branch
+now=$(date +%s)
+stale_threshold=$((30 * 24 * 60 * 60))  # 30 days in seconds for highlighting
+
+while IFS= read -r branch; do
+  # Skip empty lines
+  [[ -z "$branch" ]] && continue
+
+  # Check if branch is protected
+  is_protected=false
+  for pattern in "${protected_patterns[@]}"; do
+    if [[ "$branch" == "$pattern" ]]; then
+      is_protected=true
+      break
+    fi
+  done
+
+  if $is_protected; then
+    protected_branches+=("$branch")
+    echo -e "${BLUE}Branch:${NC} $branch ${BLUE}[PROTECTED - skipping]${NC}"
+    echo ""
+    continue
+  fi
+
+  # Check if merged (if --merged flag is set)
+  if $merged_only; then
+    is_merged=false
+    if [[ -n "$default_branch" ]]; then
+      if git merge-base --is-ancestor "$branch" "$default_branch" 2>/dev/null || \
+         git merge-base --is-ancestor "$branch" "origin/$default_branch" 2>/dev/null; then
+        is_merged=true
+      fi
+    fi
+    if ! $is_merged; then
+      continue  # Skip non-merged branches
+    fi
+  fi
+
+  # Check branch age (if --stale flag is set)
+  branch_timestamp=$(git log -1 --format="%ct" "$branch" 2>/dev/null) || true
+  branch_age_days=0
+  if [[ -n "$branch_timestamp" ]]; then
+    branch_age_days=$(( (now - branch_timestamp) / 86400 ))
+  fi
+
+  if [[ $stale_days -gt 0 ]] && [[ $branch_age_days -lt $stale_days ]]; then
+    continue  # Skip branches newer than stale threshold
+  fi
+
+  # Determine if branch is old (30+ days) for highlighting
+  is_old=false
+  if [[ -n "$branch_timestamp" ]] && [[ $((now - branch_timestamp)) -gt $stale_threshold ]]; then
+    is_old=true
+  fi
+
+  # Show branch info with age-based coloring
+  if $is_old; then
+    echo -e "${RED}Branch:${NC} $branch ${RED}(old)${NC}"
+  else
+    echo -e "${YELLOW}Branch:${NC} $branch"
+  fi
+
+  # Show last commit date and message for context
+  last_commit=$(git log -1 --format="%s - Last commit: %cr" "$branch" 2>/dev/null) || true
+  if [[ -n "$last_commit" ]]; then
+    echo "$last_commit"
+  fi
+
+  # Check remote tracking status
+  remote_info=""
+  upstream=$(git rev-parse --abbrev-ref "$branch@{upstream}" 2>/dev/null) || true
+
+  if [[ -n "$upstream" ]]; then
+    # Has upstream tracking branch
+    if git rev-parse --verify "$upstream" >/dev/null 2>&1; then
+      # Remote branch still exists
+      remote_info="${GREEN}✓ Remote exists: $upstream${NC}"
+
+      # Check if merged into default branch on remote
+      if [[ -n "$default_branch" ]]; then
+        if git merge-base --is-ancestor "$branch" "origin/$default_branch" 2>/dev/null; then
+          remote_info="$remote_info ${GREEN}(merged to $default_branch)${NC}"
+        fi
+      fi
+    else
+      # Remote branch was deleted
+      remote_info="${RED}✗ Remote deleted (was: $upstream)${NC}"
+    fi
+  else
+    # No upstream tracking
+    remote_info="${BLUE}○ No remote tracking${NC}"
+
+    # Check if merged locally into default branch
+    if [[ -n "$default_branch" ]]; then
+      if git merge-base --is-ancestor "$branch" "$default_branch" 2>/dev/null; then
+        remote_info="$remote_info ${GREEN}(merged to local $default_branch)${NC}"
+      fi
+    fi
+  fi
+
+  echo -e "$remote_info"
+
+  # Dry run mode - don't prompt, just show
+  if $dry_run; then
+    echo -e "${BLUE}[dry-run] Would prompt for deletion${NC}"
+    echo ""
+    continue
+  fi
+
+  # Prompt for action
+  answer=""
+  while true; do
+    read -p "Delete this branch? (y/n/q to quit): " answer </dev/tty
+    case $answer in
+      [Yy]* )
+        if git branch -d "$branch" 2>/dev/null; then
+          echo -e "${GREEN}Deleted: $branch${NC}"
+          deleted_branches+=("$branch")
+        else
+          echo -e "${RED}Cannot delete (not fully merged). Force delete? (y/n): ${NC}\c"
+          read -p "" force_answer </dev/tty
+          if [[ $force_answer =~ ^[Yy] ]]; then
+            if git branch -D "$branch" 2>/dev/null; then
+              echo -e "${GREEN}Force deleted: $branch${NC}"
+              deleted_branches+=("$branch (force)")
+            else
+              echo -e "${RED}Failed to delete: $branch${NC}"
+            fi
+          else
+            echo -e "${YELLOW}Skipped: $branch${NC}"
+            skipped_branches+=("$branch")
+          fi
+        fi
+        break
+        ;;
+      [Nn]* )
+        echo -e "${YELLOW}Skipped: $branch${NC}"
+        skipped_branches+=("$branch")
+        break
+        ;;
+      [Qq]* )
+        echo ""
+        echo -e "${BLUE}Quitting early...${NC}"
+        break 2
+        ;;
+      * )
+        echo "Please answer y, n, or q"
+        ;;
+    esac
+  done
+  echo ""
+done <<< "$branches"
+
+# Summary
+echo -e "${BLUE}=== Summary ===${NC}"
+echo ""
+
+if $dry_run; then
+  echo -e "${YELLOW}DRY RUN - No changes were made${NC}"
+  echo ""
+fi
+
+if [[ ${#deleted_branches[@]} -gt 0 ]]; then
+  echo -e "${GREEN}Deleted branches (${#deleted_branches[@]}):${NC}"
+  for b in "${deleted_branches[@]}"; do
+    echo "  - $b"
+  done
+  echo ""
+fi
+
+if [[ ${#skipped_branches[@]} -gt 0 ]]; then
+  echo -e "${YELLOW}Skipped branches (${#skipped_branches[@]}):${NC}"
+  for b in "${skipped_branches[@]}"; do
+    echo "  - $b"
+  done
+  echo ""
+fi
+
+if [[ ${#protected_branches[@]} -gt 0 ]]; then
+  echo -e "${BLUE}Protected branches (${#protected_branches[@]}):${NC}"
+  for b in "${protected_branches[@]}"; do
+    echo "  - $b"
+  done
+  echo ""
+fi
+
+echo -e "${YELLOW}Remaining local branches:${NC}"
+remaining_branches=$(git branch)
+while IFS= read -r b; do
+  echo "  $b"
+done <<< "$remaining_branches"
+
+echo ""
+echo -e "${GREEN}Done!${NC}"
